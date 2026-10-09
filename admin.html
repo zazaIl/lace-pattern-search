@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f3ece3">
+  <meta name="description" content="上传、编号和删除花边样品，并自动更新纹理索引。">
+  <title>样品管理 · 花边寻纹</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="header">
+      <a class="brand" href="index.html">
+        <svg class="mark" viewBox="0 0 64 64" aria-hidden="true">
+          <rect width="64" height="64" rx="16" fill="#f7f1e8"/>
+          <g fill="#8d4540">
+            <ellipse cx="32" cy="18" rx="5" ry="10"/>
+            <ellipse cx="32" cy="46" rx="5" ry="10"/>
+            <ellipse cx="18" cy="32" rx="10" ry="5"/>
+            <ellipse cx="46" cy="32" rx="10" ry="5"/>
+          </g>
+          <circle cx="32" cy="32" r="5" fill="#f7f1e8"/>
+          <circle cx="32" cy="32" r="2.6" fill="#9c7848"/>
+        </svg>
+        <span>
+          <strong class="brand-name">花边寻纹</strong>
+          <small class="brand-sub">样品管理</small>
+        </span>
+      </a>
+      <div class="header-actions">
+        <a class="btn btn-ghost" href="index.html">返回检索</a>
+      </div>
+    </header>
+
+    <section class="hero compact">
+      <p class="eyebrow">Atelier Desk</p>
+      <h1>样品管理</h1>
+      <p class="lede">把新的花边放进样品库。页面会计算纹理索引，并把图片一起写到云端。访客不需要登录，令牌只保存在你这台浏览器里。</p>
+    </section>
+
+    <section class="card-block">
+      <div class="block-head">
+        <h2>连接云端</h2>
+        <p id="status" class="status" data-state="off">未连接</p>
+      </div>
+      <label class="field">访问令牌
+        <span class="token-row">
+          <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_ 或 ghp_ 开头的令牌">
+          <button id="toggleToken" class="btn btn-ghost" type="button">显示</button>
+        </span>
+      </label>
+      <div class="row-actions">
+        <button id="connect" class="btn btn-primary" type="button" data-busy>验证连接</button>
+        <button id="disconnect" class="btn btn-ghost" type="button">断开</button>
+      </div>
+      <details class="guide">
+        <summary>如何创建令牌、上传和删除</summary>
+        <h3>创建访问令牌</h3>
+        <ol>
+          <li>用 zazaIl 登录 GitHub，打开 Settings → Developer settings → Personal access tokens。</li>
+          <li>建议选择 Fine-grained token。Repository access 只勾选 <code>lace-pattern-search</code>。</li>
+          <li>Permissions 里把 Contents 设为 Read and write，然后生成令牌。</li>
+          <li>把令牌粘贴到上面，点击「验证连接」。它只写在这台浏览器的本地存储里，不会进入网页代码。</li>
+        </ol>
+        <h3>上传样品</h3>
+        <ol>
+          <li>连接成功后，把 JPG 或 PNG 拖进上传区，也可以一次选多张。</li>
+          <li>品名编号默认取文件名，上传前可以修改。</li>
+          <li>点击「写入样品库」。页面会先计算纹理，再把图片和索引一起保存。</li>
+          <li>一次最多 40 张。五百张样品请分批写入。公开检索页通常一两分钟后能看到新图。</li>
+        </ol>
+        <h3>查看、改编号、删除</h3>
+        <ol>
+          <li>下方列表就是当前云端样品，可用编号筛选。</li>
+          <li>改完编号后点击「保存编号修改」。</li>
+          <li>点击「删除」并确认后，图片和索引会一起从云端移除。</li>
+          <li>如果以后更新了比对算法，点击「重新计算全部索引」。</li>
+        </ol>
+      </details>
+    </section>
+
+    <section class="card-block">
+      <h2>上传新样品</h2>
+      <p class="note">支持 JPG、PNG。上传前会自动缩小，并把透明背景补成白色。顶部约 15% 的文字不参与比对，缩略图仍保留完整样品。</p>
+      <div id="dropzone" class="dropzone dropzone-small">
+        <input id="file" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple hidden>
+        <svg class="drop-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+          <rect x="7" y="9" width="34" height="30" rx="6" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M24 28V16M24 16l-5 5M24 16l5 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h2>拖入样品图片</h2>
+        <p>可以一次放入多张</p>
+        <button id="browse" class="btn btn-primary" type="button">选择图片</button>
+      </div>
+      <div id="queue" class="queue" hidden></div>
+      <div id="progress" class="progress" hidden>
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+        <p id="progressText"></p>
+      </div>
+      <button id="upload" class="btn btn-primary" type="button" data-busy disabled>写入样品库</button>
+    </section>
+
+    <section class="card-block">
+      <div class="block-head">
+        <h2>全部样品 <span id="libCount">0 件</span></h2>
+        <input id="filter" type="search" placeholder="按品名编号筛选" aria-label="按品名编号筛选">
+      </div>
+      <div class="row-actions">
+        <button id="saveNames" class="btn btn-ghost" type="button" data-busy>保存编号修改</button>
+        <button id="rebuild" class="btn btn-ghost" type="button" data-busy>重新计算全部索引</button>
+      </div>
+      <div id="library" class="library"></div>
+    </section>
+
+    <footer class="footer">
+      <p>公开检索页：<a href="https://zazail.github.io/lace-pattern-search/">zazail.github.io/lace-pattern-search</a></p>
+    </footer>
+  </div>
+
+  <script src="js/config.js"></script>
+  <script src="js/features.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/image.js"></script>
+  <script src="js/github.js"></script>
+  <script src="js/admin.js"></script>
+</body>
+</html>
