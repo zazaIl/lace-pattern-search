@@ -1,7 +1,6 @@
 (function () {
   const CROP_TOP = 0.15;
   const MAX_EDGE = 960;
-  const FEATURE_EDGE = 480;
   const JPEG_QUALITY = 0.82;
 
   function isSupported(file) {
@@ -54,17 +53,14 @@
     const cropH = canvas.height - cropY;
     const cropW = canvas.width;
     if (cropW < 16 || cropH < 16) throw new Error("去掉顶部文字后，剩下的花纹区域太小");
-    const scale = Math.min(1, FEATURE_EDGE / Math.max(cropW, cropH));
-    const width = Math.max(16, Math.round(cropW * scale));
-    const height = Math.max(16, Math.round(cropH * scale));
     const out = document.createElement("canvas");
-    out.width = width;
-    out.height = height;
+    out.width = cropW;
+    out.height = cropH;
     const ctx = out.getContext("2d", { willReadFrequently: true });
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(canvas, 0, cropY, cropW, cropH, 0, 0, width, height);
-    return LaceFeatures.fromImageData(ctx.getImageData(0, 0, width, height));
+    ctx.drawImage(canvas, 0, cropY, cropW, cropH, 0, 0, cropW, cropH);
+    return LaceFeatures.fromImageData(ctx.getImageData(0, 0, cropW, cropH));
   }
 
   async function analyzeFile(file) {

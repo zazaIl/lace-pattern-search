@@ -1,16 +1,18 @@
 /* 花边纹理特征
-   1. 转成灰度梯度，去掉颜色和明暗方向
-   2. 找出花纹的重复间距，把一个到两个重复单元对齐后比较
-   3. pHash、dHash 描述单元形状，空间模板区分不同图案
-   4. 因此局部截图、变色、轻微错位仍能对上同一块花边
+   1. 灰度后做局部对比度，再取边缘，去掉颜色和明暗
+   2. 同时看整幅布局、中等花纹和较细的局部，避免只剩网眼
+   3. 32×32 结构图对齐后比较，pHash 与 dHash 辅助判断形状
 */
 (function (root, factory) {
   const api = factory();
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.LaceFeatures = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
-  const VERSION = 1;
-  const WEIGHTS = { p: 0.12, d: 0.08, t: 0.8 };
+  const VERSION = 2;
+  const WORKING_EDGE = 720;
+  const TEMPLATE = 32;
+  const TEMPLATE_AREA = TEMPLATE * TEMPLATE;
+  const WEIGHTS = { p: 0.14, d: 0.08, t: 0.78 };
   const POP = new Uint8Array(16);
   for (let i = 1; i < 16; i += 1) POP[i] = (i & 1) + POP[i >> 1];
   const byteCache = new WeakMap();
@@ -368,38 +370,187 @@
     return out;
   }
 
+  function resizeGray(src, sw, sh, dw, dh) {
+    const dst = new Float32Array(dw * dh);
+    for (let y = 0; y < dh; y += 1) {
+      const sy0 = (y * sh) / dh;
+      const sy1 = ((y + 1) * sh) / dh;
+      const yStart = Math.max(0, Math.floor(sy0));
+      const yEnd = Math.min(sh - 1, Math.max(yStart, Math.ceil(sy1) - 1));
+      for (let x = 0; x < dw; x += 1) {
+        const sx0 = (x * sw) / dw;
+        const sx1 = ((x + 1) * sw) / dw;
+        const xStart = Math.max(0, Math.floor(sx0));
+        const xEnd = Math.min(sw - 1, Math.max(xStart, Math.ceil(sx1) - 1));
+        let sum = 0;
+        let count = 0;
+        for (let yy = yStart; yy <= yEnd; yy += 1) {
+          const row = yy * sw;
+          for (let xx = xStart; xx <= xEnd; xx += 1) {
+            sum += src[row + xx];
+            count += 1;
+          }
+        }
+        dst[y * dw + x] = count ? sum / count : 0;
+      }
+    }
+    return dst;
+  }
+
+  function limitSize(gray, width, height) {
+    const scale = Math.min(1, WORKING_EDGE / Math.max(width, height));
+    if (scale >= 0.999) return { gray: gray, width: width, height: height };
+    const dw = Math.max(16, Math.round(width * scale));
+    const dh = Math.max(16, Math.round(height * scale));
+    return { gray: resizeGray(gray, width, height, dw, dh), width: dw, height: dh };
+  }
+
+  function boxMean(src, width, height, radius) {
+    const horizontal = new Float32Array(src.length);
+    const vertical = new Float32Array(src.length);
+    const span = radius * 2 + 1;
+    for (let y = 0; y < height; y += 1) {
+      const row = y * width;
+      let sum = 0;
+      for (let x = -radius; x <= radius; x += 1) sum += src[row + Math.min(width - 1, Math.max(0, x))];
+      for (let x = 0; x < width; x += 1) {
+        horizontal[row + x] = sum / span;
+        const remove = x - radius;
+        const add = x + radius + 1;
+        sum -= src[row + Math.min(width - 1, Math.max(0, remove))];
+        sum += src[row + Math.min(width - 1, Math.max(0, add))];
+      }
+    }
+    for (let x = 0; x < width; x += 1) {
+      let sum = 0;
+      for (let y = -radius; y <= radius; y += 1) sum += horizontal[Math.min(height - 1, Math.max(0, y)) * width + x];
+      for (let y = 0; y < height; y += 1) {
+        vertical[y * width + x] = sum / span;
+        const remove = y - radius;
+        const add = y + radius + 1;
+        sum -= horizontal[Math.min(height - 1, Math.max(0, remove)) * width + x];
+        sum += horizontal[Math.min(height - 1, Math.max(0, add)) * width + x];
+      }
+    }
+    return vertical;
+  }
+
+  function localContrast(gray, width, height) {
+    const radius = Math.max(4, Math.round(Math.min(width, height) / 48));
+    const mean = boxMean(gray, width, height, radius);
+    const square = new Float32Array(gray.length);
+    for (let i = 0; i < gray.length; i += 1) square[i] = gray[i] * gray[i];
+    const meanSquare = boxMean(square, width, height, radius);
+    const out = new Float32Array(gray.length);
+    for (let i = 0; i < gray.length; i += 1) {
+      const variance = Math.max(0, meanSquare[i] - mean[i] * mean[i]);
+      out[i] = (gray[i] - mean[i]) / (Math.sqrt(variance) + 6);
+    }
+    return stretch(out);
+  }
+
+  function layoutWindows(width, height) {
+    const rects = [];
+    const seen = new Set();
+    function push(x, y, side, group) {
+      const size = Math.max(24, Math.min(side, width, height));
+      const xx = Math.max(0, Math.min(width - size, Math.round(x)));
+      const yy = Math.max(0, Math.min(height - size, Math.round(y)));
+      const key = xx + "," + yy + "," + size;
+      if (seen.has(key)) return;
+      seen.add(key);
+      rects.push({ x: xx, y: yy, w: size, h: size, g: group });
+    }
+    const minSide = Math.min(width, height);
+    [
+      { scale: 0.94, g: 0, take: 2 },
+      { scale: 0.58, g: 1, take: 3 },
+      { scale: 0.34, g: 2, take: 3 }
+    ].forEach(function (plan) {
+      const side = Math.max(24, Math.round(minSide * plan.scale));
+      const step = Math.max(8, Math.round(side * 0.48));
+      const group = [];
+      for (let y = 0; y + side <= height; y += step) {
+        for (let x = 0; x + side <= width; x += step) group.push({ x: x, y: y });
+      }
+      if (!group.length) {
+        group.push({
+          x: Math.floor((width - side) / 2),
+          y: Math.floor((height - side) / 2)
+        });
+      }
+      takeEven(group, plan.take).forEach(function (item) {
+        push(item.x, item.y, side, plan.g);
+      });
+    });
+    return rects;
+  }
+
   function patchFromRect(structure, width, height, rect) {
-    const fitted = fitSquare(structure, width, height, rect, 32);
-    const dct = dct2(fitted, 32);
-    const small = downsample(fitted, 32, 9, 8);
-    const template = fitSquare(structure, width, height, rect, 16);
-    const bytes = new Uint8Array(template.length);
-    for (let i = 0; i < template.length; i += 1) {
-      bytes[i] = Math.max(0, Math.min(255, Math.round(template[i])));
+    const fitted = fitSquare(structure, width, height, rect, TEMPLATE);
+    const dct = dct2(fitted, TEMPLATE);
+    const bytes = new Uint8Array(fitted.length);
+    for (let i = 0; i < fitted.length; i += 1) {
+      bytes[i] = Math.max(0, Math.min(255, Math.round(fitted[i])));
     }
     return {
       p: phashFromDct(dct),
-      d: dhashFrom(small),
-      t: bytesToB64(bytes)
+      d: dhashFrom(downsample(fitted, TEMPLATE, 9, 8)),
+      t: bytesToB64(bytes),
+      g: rect.g
     };
+  }
+
+  function periodChunkWindows(structure, width, height) {
+    const period = Math.max(
+      findPeriod(autocorr1d(project(structure, width, height, "x"))),
+      findPeriod(autocorr1d(project(structure, width, height, "y")))
+    );
+    if (period < 8) return [];
+    const minSide = Math.min(width, height);
+    const mults = [];
+    if (period * 3 <= minSide) mults.push(3);
+    if (period * 6 <= minSide) mults.push(6);
+    if (!mults.length) mults.push(2);
+    const rects = [];
+    const seen = new Set();
+    mults.forEach(function (mult, index) {
+      const side = Math.max(24, Math.min(minSide, period * mult));
+      const step = Math.max(8, Math.round(side * 0.5));
+      const group = [];
+      for (let y = 0; y + side <= height; y += step) {
+        for (let x = 0; x + side <= width; x += step) group.push({ x: x, y: y });
+      }
+      if (!group.length) {
+        group.push({
+          x: Math.floor((width - side) / 2),
+          y: Math.floor((height - side) / 2)
+        });
+      }
+      takeEven(group, 2).forEach(function (item) {
+        const key = item.x + "," + item.y + "," + side;
+        if (seen.has(key)) return;
+        seen.add(key);
+        rects.push({ x: item.x, y: item.y, w: side, h: side, g: index === 0 ? 2 : 1 });
+      });
+    });
+    return rects;
   }
 
   function extractFeaturesFromGray(gray, width, height) {
     if (width < 16 || height < 16) throw new Error("图片太小，无法识别花纹");
-    const clean = clampGray(gray);
-    const blurred = boxBlur(clean, width, height);
-    const structure = stretch(gradientMagnitude(blurred, width, height));
-    const projX = project(structure, width, height, "x");
-    const projY = project(structure, width, height, "y");
-    const px = findPeriod(autocorr1d(projX));
-    const py = findPeriod(autocorr1d(projY));
-    const windows = px || py
-      ? periodWindows(width, height, px, py, projX, projY)
-      : fallbackWindows(width, height);
-    const patches = windows.map(function (rect) {
-      return patchFromRect(structure, width, height, rect);
-    });
-    return { patches: patches };
+    const limited = limitSize(clampGray(gray), width, height);
+    const contrasted = localContrast(limited.gray, limited.width, limited.height);
+    const blurred = boxBlur(contrasted, limited.width, limited.height);
+    const structure = stretch(gradientMagnitude(blurred, limited.width, limited.height));
+    const windows = layoutWindows(limited.width, limited.height).concat(
+      periodChunkWindows(structure, limited.width, limited.height)
+    );
+    return {
+      patches: windows.map(function (rect) {
+        return patchFromRect(structure, limited.width, limited.height, rect);
+      })
+    };
   }
 
   function fromImageData(imageData) {
@@ -421,10 +572,10 @@
   }
 
   const specCache = new WeakMap();
-  const rowRe = new Float64Array(16);
-  const rowIm = new Float64Array(16);
-  const crossRe = new Float64Array(256);
-  const crossIm = new Float64Array(256);
+  const rowRe = new Float64Array(TEMPLATE);
+  const rowIm = new Float64Array(TEMPLATE);
+  const crossRe = new Float64Array(TEMPLATE_AREA);
+  const crossIm = new Float64Array(TEMPLATE_AREA);
 
   function fftRadix2(re, im, inverse) {
     const n = re.length;
@@ -469,27 +620,27 @@
   }
 
   function fft2(re, im, inverse) {
-    for (let y = 0; y < 16; y += 1) {
-      const row = y * 16;
-      for (let x = 0; x < 16; x += 1) {
+    for (let y = 0; y < TEMPLATE; y += 1) {
+      const row = y * TEMPLATE;
+      for (let x = 0; x < TEMPLATE; x += 1) {
         rowRe[x] = re[row + x];
         rowIm[x] = im[row + x];
       }
       fftRadix2(rowRe, rowIm, inverse);
-      for (let x = 0; x < 16; x += 1) {
+      for (let x = 0; x < TEMPLATE; x += 1) {
         re[row + x] = rowRe[x];
         im[row + x] = rowIm[x];
       }
     }
-    for (let x = 0; x < 16; x += 1) {
-      for (let y = 0; y < 16; y += 1) {
-        rowRe[y] = re[y * 16 + x];
-        rowIm[y] = im[y * 16 + x];
+    for (let x = 0; x < TEMPLATE; x += 1) {
+      for (let y = 0; y < TEMPLATE; y += 1) {
+        rowRe[y] = re[y * TEMPLATE + x];
+        rowIm[y] = im[y * TEMPLATE + x];
       }
       fftRadix2(rowRe, rowIm, inverse);
-      for (let y = 0; y < 16; y += 1) {
-        re[y * 16 + x] = rowRe[y];
-        im[y * 16 + x] = rowIm[y];
+      for (let y = 0; y < TEMPLATE; y += 1) {
+        re[y * TEMPLATE + x] = rowRe[y];
+        im[y * TEMPLATE + x] = rowIm[y];
       }
     }
   }
@@ -498,13 +649,13 @@
     let spec = specCache.get(patch);
     if (spec) return spec;
     const bytes = bytesOf(patch).t;
-    const re = new Float64Array(256);
-    const im = new Float64Array(256);
+    const re = new Float64Array(TEMPLATE_AREA);
+    const im = new Float64Array(TEMPLATE_AREA);
     let mean = 0;
-    for (let i = 0; i < 256; i += 1) mean += bytes[i];
-    mean /= 256;
+    for (let i = 0; i < TEMPLATE_AREA; i += 1) mean += bytes[i];
+    mean /= TEMPLATE_AREA;
     let energy = 0;
-    for (let i = 0; i < 256; i += 1) {
+    for (let i = 0; i < TEMPLATE_AREA; i += 1) {
       const centered = bytes[i] - mean;
       re[i] = centered;
       energy += centered * centered;
@@ -518,14 +669,14 @@
   function alignPair(a, b) {
     const left = spectrumOf(a);
     const right = spectrumOf(b);
-    for (let i = 0; i < 256; i += 1) {
+    for (let i = 0; i < TEMPLATE_AREA; i += 1) {
       crossRe[i] = left.re[i] * right.re[i] + left.im[i] * right.im[i];
       crossIm[i] = left.im[i] * right.re[i] - left.re[i] * right.im[i];
     }
     fft2(crossRe, crossIm, true);
     let best = -Infinity;
     let index = 0;
-    for (let i = 0; i < 256; i += 1) {
+    for (let i = 0; i < TEMPLATE_AREA; i += 1) {
       if (crossRe[i] > best) {
         best = crossRe[i];
         index = i;
@@ -535,35 +686,35 @@
     const corr = den < 1e-8 ? 0 : best / den;
     return {
       corr: Math.max(-1, Math.min(1, corr)),
-      dx: index % 16,
-      dy: Math.floor(index / 16),
+      dx: index % TEMPLATE,
+      dy: Math.floor(index / TEMPLATE),
       bytesA: left.bytes,
       bytesB: right.bytes
     };
   }
 
   function sampleAligned(bytes, x, y, dx, dy) {
-    return bytes[((y + dy) & 15) * 16 + ((x + dx) & 15)];
+    return bytes[((y + dy) & (TEMPLATE - 1)) * TEMPLATE + ((x + dx) & (TEMPLATE - 1))];
   }
 
   function alignedHashes(bytesA, bytesB, dx, dy) {
-    const left = new Float64Array(256);
-    const right = new Float64Array(256);
-    for (let y = 0; y < 16; y += 1) {
-      for (let x = 0; x < 16; x += 1) {
-        left[y * 16 + x] = bytesA[y * 16 + x];
-        right[y * 16 + x] = sampleAligned(bytesB, x, y, dx, dy);
+    const left = new Float64Array(TEMPLATE_AREA);
+    const right = new Float64Array(TEMPLATE_AREA);
+    for (let y = 0; y < TEMPLATE; y += 1) {
+      for (let x = 0; x < TEMPLATE; x += 1) {
+        left[y * TEMPLATE + x] = bytesA[y * TEMPLATE + x];
+        right[y * TEMPLATE + x] = sampleAligned(bytesB, x, y, dx, dy);
       }
     }
-    const p = 1 - hammingHex(phashFromDct(dct2(left, 16)), phashFromDct(dct2(right, 16))) / 64;
-    const d = 1 - hammingHex(dhashFrom(downsample(left, 16, 9, 8)), dhashFrom(downsample(right, 16, 9, 8))) / 64;
+    const p = 1 - hammingHex(phashFromDct(dct2(left, TEMPLATE)), phashFromDct(dct2(right, TEMPLATE))) / 64;
+    const d = 1 - hammingHex(dhashFrom(downsample(left, TEMPLATE, 9, 8)), dhashFrom(downsample(right, TEMPLATE, 9, 8))) / 64;
     return { p: p, d: d };
   }
 
   function pairParts(a, b) {
     const aligned = alignPair(a, b);
     const texture = Math.max(0, aligned.corr);
-    const hashes = texture > 0.72 ? alignedHashes(aligned.bytesA, aligned.bytesB, aligned.dx, aligned.dy) : { p: 0.5, d: 0.5 };
+    const hashes = texture > 0.58 ? alignedHashes(aligned.bytesA, aligned.bytesB, aligned.dx, aligned.dy) : { p: 0.45, d: 0.45 };
     const total = WEIGHTS.p * hashes.p + WEIGHTS.d * hashes.d + WEIGHTS.t * texture;
     return {
       p: hashes.p,
@@ -577,20 +728,18 @@
     const left = query && query.patches ? query.patches : [];
     const right = sample && sample.patches ? sample.patches : [];
     if (!left.length || !right.length) return 0;
-    const scores = left.map(function (patch) {
-      let best = 0;
-      for (let i = 0; i < right.length; i += 1) {
-        const total = pairParts(patch, right[i]).total;
+    let best = 0;
+    let bestLarge = -1;
+    for (let i = 0; i < left.length; i += 1) {
+      for (let j = 0; j < right.length; j += 1) {
+        const total = pairParts(left[i], right[j]).total;
         if (total > best) best = total;
+        if (left[i].g === 0 && right[j].g === 0 && total > bestLarge) bestLarge = total;
       }
-      return best;
-    });
-    scores.sort(function (a, b) { return b - a; });
-    const best = scores[0];
-    const k = Math.min(2, scores.length);
-    let sum = 0;
-    for (let i = 0; i < k; i += 1) sum += scores[i];
-    return 0.82 * best + 0.18 * (sum / k);
+    }
+    if (bestLarge < 0) return best;
+    if (best > bestLarge + 0.16) return 0.82 * best + 0.18 * bestLarge;
+    return 0.7 * bestLarge + 0.3 * best;
   }
 
   function explain(query, sample) {
