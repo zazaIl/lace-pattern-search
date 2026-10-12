@@ -1,0 +1,11 @@
+{
+  "name": "lace-pattern-search",
+  "private": true,
+  "scripts": {
+    "start": "node scripts/serve.cjs",
+    "test": "node scripts/test-features.js && node scripts/test-index.js && node scripts/test-library.cjs && node scripts/smoke-ui.cjs",
+    "test:library": "node scripts/test-library.cjs",
+    "rebuild:index": "node scripts/test-library.cjs --rebuild"
+  },
+  "devDependencies": { "playwright": "1.62.1" }
+}

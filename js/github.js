@@ -16,7 +16,7 @@
     const res = await fetch("https://api.github.com" + path, {
       method: opts.method || "GET",
       headers: {
-        Accept: "application/vnd.github+json",
+        Accept: opts.accept || "application/vnd.github+json",
         Authorization: "Bearer " + token,
         "X-GitHub-Api-Version": "2022-11-28",
         "Content-Type": "application/json"
@@ -50,14 +50,6 @@
     throw last;
   }
 
-  function decodeContent(content) {
-    const clean = String(content || "").replace(/\s/g, "");
-    const binary = atob(clean);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder().decode(bytes);
-  }
-
   function emptyIndex() {
     return { version: LaceFeatures.VERSION, updated: null, samples: [] };
   }
@@ -65,10 +57,12 @@
   function normalizeIndex(index) {
     const samples = Array.isArray(index && index.samples) ? index.samples : [];
     return {
-      version: LaceFeatures.VERSION,
+      version: index && Number.isInteger(index.version) ? index.version : LaceFeatures.VERSION,
       updated: index && index.updated ? index.updated : null,
       samples: samples.filter(function (sample) {
-        return sample && LacePaths.isSampleFile(sample.file) && LaceFeatures.usableSample(sample);
+        // Keep older feature records so the admin can rebuild them rather than
+        // silently dropping the library during an algorithm upgrade.
+        return sample && LacePaths.isSampleFile(sample.file);
       })
     };
   }
@@ -87,8 +81,8 @@
 
   async function readIndex(token) {
     try {
-      const data = await gh(token, "/repos/" + cfg.owner + "/" + cfg.repo + "/contents/" + cfg.indexPath + "?ref=" + cfg.branch);
-      return normalizeIndex(JSON.parse(decodeContent(data.content)));
+      const data = await gh(token, "/repos/" + cfg.owner + "/" + cfg.repo + "/contents/" + cfg.indexPath + "?ref=" + cfg.branch, { accept: "application/vnd.github.raw+json" });
+      return normalizeIndex(data);
     } catch (err) {
       if (err.status === 404) return emptyIndex();
       throw err;

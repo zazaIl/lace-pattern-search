@@ -1,9 +1,5 @@
 (function () {
-  const PREFS_KEY = "lace-search-prefs";
-  const countInput = document.querySelector("#count");
-  const thresholdInput = document.querySelector("#threshold");
-  const countVal = document.querySelector("#countVal");
-  const thresholdVal = document.querySelector("#thresholdVal");
+  const RESULT_COUNT = 10;
   const dropzone = document.querySelector("#dropzone");
   const fileInput = document.querySelector("#file");
   const preview = document.querySelector("#preview");
@@ -34,7 +30,7 @@
   };
 
   function percent(score) {
-    return Math.max(0, Math.min(100, Math.round(score * 100)));
+    return Math.max(0, Math.min(100, Math.round(score * 1000) / 10));
   }
 
   function formatUpdated(iso) {
@@ -50,32 +46,12 @@
     });
   }
 
-  function loadPrefs() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
-      if (saved.count >= 5 && saved.count <= 20) countInput.value = String(saved.count);
-      if (saved.threshold >= 0 && saved.threshold <= 100) thresholdInput.value = String(saved.threshold);
-    } catch (err) { /* 偏好损坏时使用默认值 */ }
-    updateSliderLabels();
-  }
-
-  function savePrefs() {
-    localStorage.setItem(PREFS_KEY, JSON.stringify({
-      count: Number(countInput.value),
-      threshold: Number(thresholdInput.value)
-    }));
-  }
-
-  function updateSliderLabels() {
-    countVal.textContent = countInput.value;
-    thresholdVal.textContent = thresholdInput.value + "%";
-  }
-
   function renderLibraryMeta() {
     const samples = samplesOf(state.index);
     libCount.textContent = samples.length + " 件样品";
     libMeta.textContent = formatUpdated(state.index.updated);
-    if (state.index.version !== LaceFeatures.VERSION && samples.length) {
+    if (state.index.version !== LaceFeatures.VERSION && (state.index.samples || []).length) {
+      libCount.textContent = state.index.samples.length + " 件样品（待重建索引）";
       libMeta.textContent = "索引版本需要在管理页重新计算";
     }
   }
@@ -116,7 +92,7 @@
     dropzone.hidden = true;
     preview.hidden = false;
     resetResultsCopy();
-    resultsHint.textContent = "顶部约 15% 的文字区域不会参与比对。";
+    resultsHint.textContent = "输入图片完整保留，样本库索引排除顶部文字。";
   }
 
   function clearQuery() {
@@ -139,15 +115,8 @@
   }
 
   function renderResults() {
-    const count = Number(countInput.value);
-    const threshold = Number(thresholdInput.value);
     const ranked = state.ranked || [];
-    const visible = ranked.filter(function (item) {
-      return percent(item.score) >= threshold;
-    }).slice(0, count);
-    const hiddenByThreshold = ranked.filter(function (item) {
-      return percent(item.score) < threshold;
-    }).length;
+    const visible = ranked.slice(0, RESULT_COUNT);
 
     if (!ranked.length) {
       resultsTitle.textContent = "样品库是空的";
@@ -155,17 +124,13 @@
       grid.replaceChildren();
       return;
     }
-    if (!visible.length) {
-      resultsTitle.textContent = "没有达到相似度阈值的样品";
-      resultsHint.textContent = "可以把最低相似度调低一些。当前有 " + hiddenByThreshold + " 张低于 " + threshold + "%。";
-      grid.replaceChildren();
-      return;
+    resultsTitle.textContent = "花纹相似度 Top " + visible.length;
+    resultsHint.textContent = ranked[0].score >= 0.5
+      ? "按相似度排列，始终展示前 10 个候选。低分结果需人工核对。"
+      : "本次匹配证据较弱，展示前 10 个候选供核对；分数不代表同款概率。";
+    if (ranked.length > 1 && ranked[1].score >= 0.5 && ranked[0].score - ranked[1].score < 0.1) {
+      resultsHint.textContent = "前两项花纹接近，请结合品号和局部细节核对；相似度不代表同款概率。";
     }
-
-    resultsTitle.textContent = "最相似的 " + visible.length + " 个样品";
-    resultsHint.textContent = hiddenByThreshold
-      ? "已隐藏 " + hiddenByThreshold + " 张低于 " + threshold + "% 的结果。"
-      : "按花纹相似度从高到低排列。";
 
     const fragment = document.createDocumentFragment();
     visible.forEach(function (item, index) {
@@ -186,8 +151,10 @@
         LaceUI.el("p", { class: "rank", text: String(index + 1).padStart(2, "0") }),
         button,
         LaceUI.el("div", { class: "card-meta" }, [
-          LaceUI.el("h3", { text: sample.name || "未命名" }),
+          LaceUI.el("h3", { text: sample.name || "未命名", title: sample.name || "未命名" }),
+          LaceUI.el("p", { class: "match-status", text: item.score >= 0.65 ? "花纹对应较强" : item.score >= 0.5 ? "有局部花纹对应" : "证据不足，待核对" }),
           LaceUI.el("p", { class: "score" }, [
+            LaceUI.el("span", { class: "score-label", text: "相似度" }),
             LaceUI.el("span", { class: "score-num", text: String(score) }),
             LaceUI.el("span", { class: "score-unit", text: "%" })
           ]),
@@ -208,6 +175,10 @@
       return;
     }
     const samples = samplesOf(state.index);
+    if (!state.ready && (state.index.samples || []).length) {
+      LaceUI.toast("样品索引版本与当前页面不一致，请到管理页重新计算索引。");
+      return;
+    }
     if (!samples.length) {
       state.ranked = [];
       renderResults();
@@ -217,12 +188,18 @@
       LaceUI.toast("样品索引版本与当前页面不一致，请到管理页重新计算索引。");
       return;
     }
+    const queryFile = state.file;
+    const queryIndex = state.index;
     state.busy = true;
     searchBtn.disabled = true;
     searchBtn.textContent = "正在比对花纹…";
     try {
-      const analyzed = await LaceImage.analyzeFile(state.file);
-      state.ranked = LaceFeatures.rank(analyzed.features, samples);
+      const analyzed = await LaceImage.analyzeFile(queryFile);
+      const ranked = await LaceFeatures.rankAsync(analyzed.features, samples, function (done, total) {
+        searchBtn.textContent = "正在比对花纹 " + done + " / " + total;
+      });
+      if (state.file !== queryFile || state.index !== queryIndex) return;
+      state.ranked = ranked;
       renderResults();
     } catch (err) {
       LaceUI.toast(err.message || "比对失败，请换一张图片再试。");
@@ -254,16 +231,6 @@
       LaceUI.toast("暂时没有读到样品库，请稍后再试。");
     });
   });
-  countInput.addEventListener("input", function () {
-    updateSliderLabels();
-    savePrefs();
-    if (state.ranked) renderResults();
-  });
-  thresholdInput.addEventListener("input", function () {
-    updateSliderLabels();
-    savePrefs();
-    if (state.ranked) renderResults();
-  });
   viewerClose.addEventListener("click", function () { viewer.close(); });
   viewer.addEventListener("click", function (event) {
     if (event.target === viewer) viewer.close();
@@ -274,7 +241,6 @@
     onFiles: function (files) { setQueryFile(files[0], files.length > 1); }
   });
 
-  loadPrefs();
   loadIndex().catch(function () {
     libCount.textContent = "样品库不可用";
     libMeta.textContent = "请稍后再刷新";

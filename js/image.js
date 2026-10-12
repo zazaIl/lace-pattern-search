@@ -1,5 +1,4 @@
 (function () {
-  const CROP_TOP = 0.15;
   const MAX_EDGE = 960;
   const JPEG_QUALITY = 0.82;
 
@@ -48,26 +47,17 @@
     return drawBitmap(bitmap, Math.max(bitmap.width, bitmap.height));
   }
 
-  function featuresFromCanvas(canvas) {
-    const cropY = Math.round(canvas.height * CROP_TOP);
-    const cropH = canvas.height - cropY;
-    const cropW = canvas.width;
-    if (cropW < 16 || cropH < 16) throw new Error("去掉顶部文字后，剩下的花纹区域太小");
-    const out = document.createElement("canvas");
-    out.width = cropW;
-    out.height = cropH;
-    const ctx = out.getContext("2d", { willReadFrequently: true });
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(canvas, 0, cropY, cropW, cropH, 0, 0, cropW, cropH);
-    return LaceFeatures.fromImageData(ctx.getImageData(0, 0, cropW, cropH));
+  function featuresFromCanvas(canvas, options) {
+    if (canvas.width < 16 || canvas.height < 16) throw new Error("图片太小，无法识别花纹");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    return LaceFeatures.fromImageData(ctx.getImageData(0, 0, canvas.width, canvas.height), options);
   }
 
-  async function analyzeFile(file) {
+  async function analyzeFile(file, options) {
     const canvas = await fileToCanvas(file, MAX_EDGE);
     const blob = await canvasToJpegBlob(canvas, JPEG_QUALITY);
     const decoded = await blobToCanvas(blob);
-    const features = featuresFromCanvas(decoded);
+    const features = await featuresFromCanvas(decoded, options);
     return {
       features: features,
       blob: blob,
@@ -76,12 +66,12 @@
     };
   }
 
-  async function analyzeUrl(url) {
+  async function analyzeUrl(url, options) {
     const response = await fetch(url, { cache: "no-store" });
     if (!response.ok) throw new Error("读取样品图片失败");
     const blob = await response.blob();
     const canvas = await blobToCanvas(blob);
-    return featuresFromCanvas(canvas);
+    return featuresFromCanvas(canvas, options || { trimHeader: true });
   }
 
   function cleanName(name) {
@@ -95,7 +85,6 @@
   }
 
   window.LaceImage = {
-    CROP_TOP: CROP_TOP,
     isSupported: isSupported,
     analyzeFile: analyzeFile,
     analyzeUrl: analyzeUrl,

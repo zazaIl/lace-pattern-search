@@ -173,7 +173,7 @@
     const index = await response.json();
     if (!Array.isArray(index.samples)) return LaceGitHub.emptyIndex();
     index.samples = index.samples.filter(function (sample) {
-      return LacePaths.isSampleFile(sample.file) && LaceFeatures.usableSample(sample);
+      return sample && LacePaths.isSampleFile(sample.file);
     });
     return index;
   }
@@ -266,24 +266,31 @@
       for (let i = 0; i < pending.length; i += 1) {
         setProgress("正在计算纹理索引 " + (i + 1) + " / " + pending.length, i / pending.length);
         const item = pending[i];
-        const analyzed = await LaceImage.analyzeFile(item.file);
+        const analyzed = await LaceImage.analyzeFile(item.file, { trimHeader: true });
         const id = createId();
         prepared.push({
           id: id,
           name: LaceImage.cleanName(item.name),
           file: "samples/" + id + ".jpg",
           patches: analyzed.features.patches,
+          local: analyzed.features.local,
+          shape: analyzed.features.shape,
           blob: analyzed.blob
         });
         await new Promise(function (resolve) { setTimeout(resolve, 0); });
       }
       const index = await LaceGitHub.readIndex(state.token);
+      if (index.samples.length && (index.version !== LaceFeatures.VERSION || !index.samples.every(LaceFeatures.usableSample))) {
+        throw new Error("请先重新计算全部样品索引，再上传新样品。");
+      }
       prepared.forEach(function (item) {
         index.samples.push({
           id: item.id,
           name: item.name,
           file: item.file,
-          patches: item.patches
+          patches: item.patches,
+          shape: item.shape,
+          local: item.local
         });
       });
       index.version = LaceFeatures.VERSION;
@@ -348,7 +355,6 @@
         return;
       }
       index.updated = new Date().toISOString();
-      index.version = LaceFeatures.VERSION;
       await LaceGitHub.commitFiles(state.token, {
         message: "更新品名编号",
         files: [{ path: window.LACE_CONFIG.indexPath, text: JSON.stringify(index, null, 2) }],
@@ -378,7 +384,6 @@
       const index = await LaceGitHub.readIndex(state.token);
       index.samples = index.samples.filter(function (item) { return item.id !== sample.id; });
       index.updated = new Date().toISOString();
-      index.version = LaceFeatures.VERSION;
       await LaceGitHub.commitFiles(state.token, {
         message: "删除样品 " + (sample.name || sample.id),
         files: [{ path: window.LACE_CONFIG.indexPath, text: JSON.stringify(index, null, 2) }],
@@ -414,6 +419,8 @@
         setProgress("正在重新计算 " + (i + 1) + " / " + index.samples.length, i / index.samples.length);
         const features = await LaceImage.analyzeUrl(LaceGitHub.rawUrl(sample.file, String(Date.now())));
         sample.patches = features.patches;
+        sample.local = features.local;
+        sample.shape = features.shape;
         await new Promise(function (resolve) { setTimeout(resolve, 0); });
       }
       index.version = LaceFeatures.VERSION;

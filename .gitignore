@@ -1,4 +1,5 @@
 .DS_Store
 .tools/
 scripts/tmp/
+node_modules/
 Icon?

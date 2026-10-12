@@ -1,14 +1,14 @@
-/* 花边纹理特征
-   1. 灰度后做局部对比度，再取边缘，去掉颜色和明暗
-   2. 同时看整幅布局、中等花纹和较细的局部，避免只剩网眼
-   3. 32×32 结构图对齐后比较，pHash 与 dHash 辅助判断形状
-*/
+/* Coverage-normalized local features verify the pattern geometrically.
+   Hash/texture similarity is auxiliary evidence, never proof of a match. */
 (function (root, factory) {
-  const api = factory();
+  const api = factory(root);
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   root.LaceFeatures = api;
-})(typeof globalThis !== "undefined" ? globalThis : this, function () {
-  const VERSION = 2;
+})(typeof globalThis !== "undefined" ? globalThis : this, function (root) {
+  const Local = root.LaceLocalFeatures || (typeof require === "function" ? require("./local-features.js") : null);
+  const Shape = root.LaceShapeFeatures || (typeof require === "function" ? require("./shape-features.js") : null);
+  const VERSION = 5;
+  const matchesCache = new WeakMap();
   const WORKING_EDGE = 720;
   const TEMPLATE = 32;
   const TEMPLATE_AREA = TEMPLATE * TEMPLATE;
@@ -112,7 +112,7 @@
   }
 
   function stretch(src) {
-    const sorted = Array.from(src).sort((a, b) => a - b);
+    const sorted = src.slice().sort();
     const low = sorted[Math.floor(sorted.length * 0.02)] || 0;
     const high = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))] || 1;
     const span = Math.max(1e-6, high - low);
@@ -537,7 +537,7 @@
     return rects;
   }
 
-  function extractFeaturesFromGray(gray, width, height) {
+  function extractTextureFeaturesFromGray(gray, width, height) {
     if (width < 16 || height < 16) throw new Error("图片太小，无法识别花纹");
     const limited = limitSize(clampGray(gray), width, height);
     const contrasted = localContrast(limited.gray, limited.width, limited.height);
@@ -553,15 +553,21 @@
     };
   }
 
-  function fromImageData(imageData) {
-    const width = imageData.width;
-    const height = imageData.height;
-    const src = imageData.data;
-    const gray = new Float32Array(width * height);
-    for (let i = 0, p = 0; i < src.length; i += 4, p += 1) {
-      gray[p] = src[i] * 0.299 + src[i + 1] * 0.587 + src[i + 2] * 0.114;
-    }
-    return extractFeaturesFromGray(gray, width, height);
+  async function extractFeaturesFromGray(gray, width, height, featureTop, library) {
+    if (width < 16 || height < 16 || gray.length !== width * height) throw new Error("图片太小或像素数据无效");
+    const limited = limitSize(clampGray(gray), width, height);
+    const bytes = Uint8Array.from(limited.gray, function (v) { return Math.round(v); });
+    const result = extractTextureFeaturesFromGray(bytes, limited.width, limited.height);
+    result.local = await Local.extract(bytes, limited.width, limited.height, Math.round((featureTop || 0) * limited.height / height));
+    result.shape = await Shape.extract(bytes, limited.width, limited.height, Math.round((featureTop || 0) * limited.height / height), library);
+    return result;
+  }
+
+  async function fromImageData(imageData, options) {
+    const prepared = await Local.prepare(imageData, options);
+    const result = await extractFeaturesFromGray(prepared.gray, prepared.width, prepared.height, prepared.featureTop, !!(options && options.trimHeader));
+    result.region = prepared.region;
+    return result;
   }
 
   function hammingHex(a, b) {
@@ -694,7 +700,7 @@
   }
 
   function sampleAligned(bytes, x, y, dx, dy) {
-    return bytes[((y + dy) & (TEMPLATE - 1)) * TEMPLATE + ((x + dx) & (TEMPLATE - 1))];
+    return bytes[((y - dy) & (TEMPLATE - 1)) * TEMPLATE + ((x - dx) & (TEMPLATE - 1))];
   }
 
   function alignedHashes(bytesA, bytesB, dx, dy) {
@@ -714,7 +720,7 @@
   function pairParts(a, b) {
     const aligned = alignPair(a, b);
     const texture = Math.max(0, aligned.corr);
-    const hashes = texture > 0.58 ? alignedHashes(aligned.bytesA, aligned.bytesB, aligned.dx, aligned.dy) : { p: 0.45, d: 0.45 };
+    const hashes = alignedHashes(aligned.bytesA, aligned.bytesB, aligned.dx, aligned.dy);
     const total = WEIGHTS.p * hashes.p + WEIGHTS.d * hashes.d + WEIGHTS.t * texture;
     return {
       p: hashes.p,
@@ -724,7 +730,7 @@
     };
   }
 
-  function compareFeatures(query, sample) {
+  function compareTextureFeatures(query, sample) {
     const left = query && query.patches ? query.patches : [];
     const right = sample && sample.patches ? sample.patches : [];
     if (!left.length || !right.length) return 0;
@@ -742,7 +748,7 @@
     return 0.7 * bestLarge + 0.3 * best;
   }
 
-  function explain(query, sample) {
+  function explainTexture(query, sample) {
     let best = null;
     const left = query.patches || [];
     const right = sample.patches || [];
@@ -755,16 +761,71 @@
     return best;
   }
 
+  function explain(query, sample) {
+    const cached = matchesCache.get(query);
+    if (cached && cached.has(sample)) return cached.get(sample);
+    const local = explainLocal(query, sample);
+    if (local.score < .65 && query && sample && Shape.usable(query.shape) && Shape.usable(sample.shape)) {
+      const shape = Shape.verify(query.shape, { sample: sample }, true);
+      if (shape.score > local.score) return shape;
+    }
+    return local;
+  }
+
+  function explainLocal(query, sample) {
+    const geometry = Local.compare(query && query.local, sample && sample.local);
+    if (!geometry.verified && geometry.appearance > 0) {
+      return Object.assign({}, geometry, { score: Math.min(0.2, geometry.appearance), method: "structure-reference" });
+    }
+    return geometry;
+  }
+
+  function compareFeatures(query, sample) { return explain(query, sample).score; }
+
+  function rankingPlan(query, samples) {
+    const rows = Shape.candidates(query.shape, samples);
+    const cache = new Map(); matchesCache.set(query, cache);
+    return { rows: rows, cache: cache, maxVotes: rows.length ? rows[0].votes : 0 };
+  }
+
+  function rankRow(query, row, i, plan) {
+    let geometry = { score: row.votes ? Math.min(.2, .2 * (1 - Math.exp(-row.votes / 35))) : 0, verified: false, method: "structure-reference" };
+    if (i < 24 && row.votes >= Math.max(2, plan.maxVotes * .08)) {
+      const shape = Shape.verify(query.shape, row);
+      const local = shape.score >= .65 ? { score: 0 } : explainLocal(query, row.sample);
+      if (local.score > geometry.score) geometry = local;
+      if (shape.score > geometry.score) geometry = shape;
+      // Pairwise descriptors rescue shared motifs suppressed by global votes.
+      // Restrict this expensive fallback to plausible leading candidates.
+      if (geometry.score < .5 && i < 6 && row.votes >= Math.max(10, plan.maxVotes * .2)) {
+        const fine = Shape.verify(query.shape, row, true);
+        if (fine.score > geometry.score) geometry = fine;
+      }
+    }
+    plan.cache.set(row.sample, geometry);
+    return { sample: row.sample, score: geometry.score };
+  }
+
   function rank(queryFeatures, samples) {
-    return samples.map(function (sample) {
-      return { sample: sample, score: compareFeatures(queryFeatures, sample) };
-    }).sort(function (a, b) { return b.score - a.score; });
+    const plan = rankingPlan(queryFeatures, samples);
+    return plan.rows.map(function(row, i) { return rankRow(queryFeatures, row, i, plan); }).sort(function(a,b) { return b.score-a.score; });
+  }
+
+  async function rankAsync(queryFeatures, samples, onProgress) {
+    await Shape.ready();
+    const plan = rankingPlan(queryFeatures, samples), ranked = [];
+    for (let i=0; i<plan.rows.length; i++) {
+      ranked.push(rankRow(queryFeatures, plan.rows[i], i, plan));
+      if (onProgress) onProgress(i+1, samples.length);
+      if (i<24 && i%3===2) await new Promise(function(resolve) { setTimeout(resolve,0); });
+    }
+    return ranked.sort(function(a,b) { return b.score-a.score; });
   }
 
   function usableSample(sample) {
-    if (!sample || !Array.isArray(sample.patches) || !sample.patches.length) return false;
+    if (!sample || !Shape.usable(sample.shape) || !Local.usable(sample.local) || !Array.isArray(sample.patches) || !sample.patches.length) return false;
     return sample.patches.every(function (patch) {
-      return patch && patch.p && patch.d && patch.t;
+      return patch && /^[0-9a-f]{16}$/.test(patch.p) && /^[0-9a-f]{16}$/.test(patch.d) && typeof patch.t === "string" && b64ToBytes(patch.t).length === TEMPLATE_AREA;
     });
   }
 
@@ -776,7 +837,9 @@
     compareFeatures: compareFeatures,
     explain: explain,
     rank: rank,
+    rankAsync: rankAsync,
     usableSample: usableSample,
-    b64ToBytes: b64ToBytes
+    b64ToBytes: b64ToBytes,
+    comparePatches: pairParts
   };
 });
